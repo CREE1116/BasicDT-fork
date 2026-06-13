@@ -20,6 +20,7 @@
 struct BasicDTCtx {
   const float* X = nullptr;
   int N = 0, D = 0, D_num = 0, D_cat = 0;
+  int n_bins = AX_BINS;                 // runtime max_bin (<=256, fits uint8)
   std::vector<uint8_t> code;            // N·D uint8 bin codes
   std::vector<float> ax_min, ax_range;  // per-feature bin frame
   std::vector<float> col_mean;          // [D_num] numeric impute means μ_f
@@ -63,13 +64,18 @@ extern "C" {
 
 // Pre-bin all features once.
 GF_API void* basicdt_ctx_create(const float* X, int N, int D, int D_num,
-                                const int* sub, int Ns) {
+                                const int* sub, int Ns, int max_bin) {
   auto* ctx = new BasicDTCtx();
   ctx->X = X;
   ctx->N = N;
   ctx->D = D;
   ctx->D_num = D_num;
   ctx->D_cat = D - D_num;
+  // Runtime bin count (max_bin). Clamp to [2, 256]: codes are uint8, and the
+  // top bin is reserved as the missing-value sentinel. Shadow the compile-time
+  // AX_BINS for the rest of this function so all binning uses the runtime value.
+  ctx->n_bins = (max_bin < 2) ? 256 : (max_bin > 256 ? 256 : max_bin);
+  const int AX_BINS = ctx->n_bins;
   ctx->ax_min.assign(D, 0.0f);
   ctx->ax_range.assign(D, 0.0f);
   ctx->col_mean.assign(D_num, 0.0f);
@@ -102,7 +108,7 @@ GF_API void* basicdt_ctx_create(const float* X, int N, int D, int D_num,
     float range = ax_max[f] - ax_lo[f];
     if (range > 1e-12f) {
       ctx->ax_range[f] = range;
-      ax_scale[f] = (float)AX_BINS / (range + EPS);
+      ax_scale[f] = (float)(AX_BINS - 1) / (range + EPS);
     }
   }
 
@@ -114,12 +120,18 @@ GF_API void* basicdt_ctx_create(const float* X, int N, int D, int D_num,
     uint8_t* GF_RESTRICT ci = ctx->code.data() + (size_t)i * D;
     for (int f = 0; f < D_num; f++) {
       float v = xi[f];
-      if (std::isnan(v)) v = ctx->col_mean[f];
-      if (ctx->ax_range[f] == 0.0f) continue;
-      int b = (int)((v - ctx->ax_min[f]) * ax_scale[f]);
-      if (b < 0) b = 0;
-      if (b >= AX_BINS) b = AX_BINS - 1;
-      ci[f] = (uint8_t)b;
+      if (std::isnan(v)) {
+        ci[f] = AX_BINS - 1;
+      } else {
+        if (ctx->ax_range[f] == 0.0f) {
+          ci[f] = 0;
+        } else {
+          int b = (int)((v - ctx->ax_min[f]) * ax_scale[f]);
+          if (b < 0) b = 0;
+          if (b >= AX_BINS - 1) b = AX_BINS - 2;
+          ci[f] = (uint8_t)b;
+        }
+      }
     }
   }
 
@@ -184,11 +196,28 @@ GF_API void basicdt_set_num_threads(int n) {
 }
 
 // ─── basicdt_build ─────────────────────────────────────────────────────────
+// L1 soft-threshold on the gradient numerator (XGB-style reg_alpha): shrinks
+// the leaf weight toward 0 by `alpha`, zeroing it inside [-alpha, alpha]. Used
+// identically in the split-gain numerator and the leaf weight so both stay
+// consistent. alpha <= 0 is a no-op (returns g unchanged).
+static inline float thr_l1(float g, float alpha) {
+  if (alpha <= 0.0f) return g;
+  if (g > alpha) return g - alpha;
+  if (g < -alpha) return g + alpha;
+  return 0.0f;
+}
+
 GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
                            int K, const int* sub, int Ns, int max_depth,
-                           float reg_lambda, float* out_pred) {
+                           int max_leaves, float reg_lambda, float colsample,
+                           unsigned int col_seed, float gamma,
+                           float min_child_weight, float reg_alpha,
+                           float* out_pred) {
   auto* ctx = static_cast<BasicDTCtx*>(ctx_handle);
   const int D = ctx->D, D_num = ctx->D_num, D_cat = ctx->D_cat, N = ctx->N;
+  // Shadow compile-time AX_BINS with the context's runtime bin count so every
+  // histogram/scan/threshold site below uses max_bin without further edits.
+  const int AX_BINS = ctx->n_bins;
   // Multi-class histogram: each bin holds per-class G[KH], H[KH] and a count,
   // so split gain is scored across ALL classes (XGBoost-grade), not just the
   // dominant one. Layout per bin: [G_0..G_{KH-1}, H_0..H_{KH-1}, count].
@@ -215,12 +244,24 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
     ctx->hist_workspace.resize(required_workspace_size);
   }
 
-  const int internal_depth = std::min(max_depth, 22);
-  const int max_leaves = 1 << max_depth;
-  const int max_nodes = 2 * max_leaves - 1;
+  int internal_depth = max_depth;
+  if (internal_depth <= 0) {
+    internal_depth = 22;
+  }
+  internal_depth = std::min(internal_depth, 22);
 
+  int actual_max_leaves = max_leaves;
+  if (actual_max_leaves <= 0) {
+    actual_max_leaves = 1 << internal_depth;
+  }
+  const int max_leaves_limit = actual_max_leaves;
+  const int max_nodes = 2 * max_leaves_limit - 1;
+
+  // Dominant class (by abs-gradient mass) only drives the categorical
+  // target-rank re-encoding below. With no categorical features the Ns×K scan
+  // is pure waste, so skip it — a measurable win at large N / many rounds.
   int kdom = 0;
-  {
+  if (D_cat > 0) {
     float best_mass = -1.0f;
     for (int c = 0; c < K; c++) {
       float mcl = 0.0f;
@@ -247,6 +288,7 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
   tree->split_gain.assign(max_nodes, 0.0f);
   tree->left_child.assign(max_nodes, -1);
   tree->right_child.assign(max_nodes, -1);
+  tree->default_left.assign(max_nodes, 1);
   tree->na_means.assign(D, 0.0f);
   std::copy(ctx->col_mean.begin(), ctx->col_mean.end(), tree->na_means.begin());
 
@@ -329,9 +371,9 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
 #ifdef _OPENMP
     if (nr >= 16384) {
       nthreads = omp_get_max_threads();
-    } else if (nr >= 4096) {
+    } else if (nr >= 8192) {
       nthreads = std::min(4, omp_get_max_threads());
-    } else if (nr >= 1024) {
+    } else if (nr >= 4096) {
       nthreads = std::min(2, omp_get_max_threads());
     }
 #endif
@@ -511,30 +553,58 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
   std::vector<float> cand_thr(max_nodes, 0.0f);
   std::vector<int> cand_axis(max_nodes, -1);
   std::vector<int> cand_bcode(max_nodes, 0);
+  std::vector<uint8_t> cand_default_left(max_nodes, 1);
 
   struct BestSplit {
     float gain = 0.0f;
     float thr = 0.0f;
     int axis = -1;
     int bcode = 0;
+    uint8_t default_left = 1;
   };
+
+  // Column subsampling at split search (colsample_bynode). colsample >= 1 keeps
+  // every feature (zero overhead, bit-identical to the un-sampled engine). Below
+  // 1, each node draws its own feature subset from a node-seeded xorshift RNG so
+  // builds stay deterministic and reproducible. The histogram is still built
+  // over all D features (subtraction trick is unaffected); this restricts which
+  // features are scored for the shared split, acting as a regulariser.
+  const bool do_colsample = (colsample < 0.999f && D > 1);
+  std::vector<char> feat_include(D, 1);
 
   // ── Axis scan ────────────────────────────────────────────────────────────
   auto eval_axis = [&](int t) -> float {
     int ns = node_ns[t];
     const float* GF_RESTRICT hb = node_hist[t].data();
 
+    if (do_colsample) {
+      uint32_t s = col_seed ^ ((uint32_t)t * 2654435761u);
+      s = s ? s : 0x9e3779b9u;
+      int cnt = 0;
+      for (int f = 0; f < D; f++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        float u = (float)(s & 0xFFFFFFu) / (float)0x1000000;
+        feat_include[f] = (u < colsample) ? 1 : 0;
+        cnt += feat_include[f];
+      }
+      if (cnt == 0) {  // guarantee at least one candidate feature
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        feat_include[s % (uint32_t)D] = 1;
+      }
+    }
+
     // Per-class node totals and the no-split objective base, summed over classes.
     const float* GF_RESTRICT GtK = node_G.data() + (size_t)t * K;
     const float* GF_RESTRICT HtK = node_H.data() + (size_t)t * K;
     double total_base_d = 0.0, Ht_sum_d = 0.0;
     for (int c = 0; c < K; c++) {
-      total_base_d += -0.5 * (double)GtK[c] * GtK[c] / ((double)HtK[c] + reg_lambda + EPS);
+      float G_thr = thr_l1(GtK[c], reg_alpha);
+      total_base_d += -0.5 * (double)G_thr * G_thr / ((double)HtK[c] + reg_lambda + EPS);
       Ht_sum_d += HtK[c];
     }
     const float total_base = (float)total_base_d;
     const float Ht_sum = (float)Ht_sum_d;
-    BestSplit best{0.0f, 0.0f, -1, 0};
+    BestSplit best{std::max(0.0f, gamma), 0.0f, -1, 0, 1};
 
     // Scan one feature's histogram for its best split, scoring gain across all
     // K classes. Gc/Hc are caller-owned scratch of length K (per-thread). For
@@ -544,45 +614,143 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
     const float mirror = (K == 2) ? 2.0f : 1.0f;
     auto scan_feature = [&](int f, float* GF_RESTRICT Gc, float* GF_RESTRICT Hc,
                             BestSplit& lb) {
+      if (do_colsample && !feat_include[f]) return;
       if (ctx->ax_range[f] == 0.0f) return;
       const float* GF_RESTRICT fbuf = hb + (size_t)f * AX_BINS * STRIDE;
+      const bool is_numeric = (f < D_num);
+      int limit_b = is_numeric ? (AX_BINS - 2) : (AX_BINS - 1);
       int min_b = 0;
-      while (min_b < AX_BINS - 1 && fbuf[(size_t)min_b * STRIDE + COFF] == 0.0f) {
+      while (min_b < limit_b && fbuf[(size_t)min_b * STRIDE + COFF] == 0.0f) {
         min_b++;
       }
-      int max_b = AX_BINS - 1;
+      int max_b = limit_b;
       while (max_b > min_b && fbuf[(size_t)max_b * STRIDE + COFF] == 0.0f) {
         max_b--;
       }
       std::memset(Gc, 0, KH * sizeof(float));
       std::memset(Hc, 0, KH * sizeof(float));
       int n_left = 0;
-      for (int b = min_b; b < max_b; b++) {
-        const float* GF_RESTRICT slot = fbuf + (size_t)b * STRIDE;
-        n_left += (int)slot[COFF];
-        float Hl_sum = 0.0f;
-        for (int c = 0; c < KH; c++) {
-          Gc[c] += slot[GOFF + c];
-          Hc[c] += slot[HOFF + c];
-          Hl_sum += Hc[c];
+
+      if (is_numeric) {
+        const float* GF_RESTRICT missing_slot = fbuf + (size_t)(AX_BINS - 1) * STRIDE;
+        const int n_missing = (int)missing_slot[COFF];
+        float GM_stack[256], HM_stack[256];
+        float* GM = GM_stack;
+        float* HM = HM_stack;
+        std::vector<float> GM_vec, HM_vec;
+        if (KH > 256) {
+          GM_vec.assign(KH, 0.0f);
+          HM_vec.assign(KH, 0.0f);
+          GM = GM_vec.data();
+          HM = HM_vec.data();
+        } else {
+          std::memset(GM_stack, 0, KH * sizeof(float));
+          std::memset(HM_stack, 0, KH * sizeof(float));
         }
-        Hl_sum *= mirror;
-        int n_right = ns - n_left;
-        if (n_left < 10 || n_right < 10) continue;
-        if (Hl_sum < MIN_CHILD_W || (Ht_sum - Hl_sum) < MIN_CHILD_W) continue;
-        float gain = total_base;
+        float HM_sum = 0.0f;
         for (int c = 0; c < KH; c++) {
-          float Gr = GtK[c] - Gc[c], Hr = HtK[c] - Hc[c];
-          gain += 0.5f * mirror *
-                  (Gc[c] * Gc[c] / (Hc[c] + reg_lambda + EPS) +
-                   Gr * Gr / (Hr + reg_lambda + EPS));
+          GM[c] = missing_slot[GOFF + c];
+          HM[c] = missing_slot[HOFF + c];
+          HM_sum += HM[c];
         }
-        if (gain > lb.gain ||
-            (gain == lb.gain && lb.axis >= 0 && f < lb.axis)) {
-          lb.gain = gain;
-          lb.axis = f;
-          lb.bcode = b;
-          lb.thr = ctx->ax_min[f] + ((float)(b + 1) / AX_BINS) * ctx->ax_range[f];
+        HM_sum *= mirror;
+
+        for (int b = min_b; b < max_b; b++) {
+          const float* GF_RESTRICT slot = fbuf + (size_t)b * STRIDE;
+          n_left += (int)slot[COFF];
+          float Hl_sum = 0.0f;
+          for (int c = 0; c < KH; c++) {
+            Gc[c] += slot[GOFF + c];
+            Hc[c] += slot[HOFF + c];
+            Hl_sum += Hc[c];
+          }
+          Hl_sum *= mirror;
+          int n_right = ns - n_left - n_missing;
+
+          // Option 1: Missing to LEFT
+          int nl1 = n_left + n_missing;
+          int nr1 = n_right;
+          float hl1 = Hl_sum + HM_sum;
+          float hr1 = Ht_sum - hl1;
+          bool ok_left = (nl1 >= 10) && (nr1 >= 10) && (hl1 >= min_child_weight) && (hr1 >= min_child_weight);
+          float gain_left = -1e30f;
+          if (ok_left) {
+            gain_left = total_base;
+            for (int c = 0; c < KH; c++) {
+              float Gl = Gc[c] + GM[c], Hl = Hc[c] + HM[c];
+              float Gr = GtK[c] - Gl, Hr = HtK[c] - Hl;
+              float Gl_thr = thr_l1(Gl, reg_alpha);
+              float Gr_thr = thr_l1(Gr, reg_alpha);
+              gain_left += 0.5f * mirror *
+                           (Gl_thr * Gl_thr / (Hl + reg_lambda + EPS) +
+                            Gr_thr * Gr_thr / (Hr + reg_lambda + EPS));
+            }
+          }
+
+          // Option 2: Missing to RIGHT
+          int nl2 = n_left;
+          int nr2 = n_right + n_missing;
+          float hl2 = Hl_sum;
+          float hr2 = Ht_sum - hl2;
+          bool ok_right = (nl2 >= 10) && (nr2 >= 10) && (hl2 >= min_child_weight) && (hr2 >= min_child_weight);
+          float gain_right = -1e30f;
+          if (ok_right) {
+            gain_right = total_base;
+            for (int c = 0; c < KH; c++) {
+              float Gl = Gc[c], Hl = Hc[c];
+              float Gr = GtK[c] - Gl, Hr = HtK[c] - Hl;
+              float Gl_thr = thr_l1(Gl, reg_alpha);
+              float Gr_thr = thr_l1(Gr, reg_alpha);
+              gain_right += 0.5f * mirror *
+                            (Gl_thr * Gl_thr / (Hl + reg_lambda + EPS) +
+                             Gr_thr * Gr_thr / (Hr + reg_lambda + EPS));
+            }
+          }
+
+          float best_gain_here = std::max(gain_left, gain_right);
+          uint8_t best_default_left = (gain_left >= gain_right) ? 1 : 0;
+
+          if (best_gain_here > lb.gain) {
+            lb.gain = best_gain_here;
+            lb.axis = f;
+            lb.bcode = b;
+            lb.thr = ctx->ax_min[f] + ((float)(b + 1) / AX_BINS) * ctx->ax_range[f];
+            lb.default_left = best_default_left;
+          }
+        }
+      } else {
+        // Categorical split finding (standard)
+        for (int b = min_b; b < max_b; b++) {
+          const float* GF_RESTRICT slot = fbuf + (size_t)b * STRIDE;
+          n_left += (int)slot[COFF];
+          float Hl_sum = 0.0f;
+          for (int c = 0; c < KH; c++) {
+            Gc[c] += slot[GOFF + c];
+            Hc[c] += slot[HOFF + c];
+            Hl_sum += Hc[c];
+          }
+          Hl_sum *= mirror;
+          int n_right = ns - n_left;
+          bool ok = (n_left >= 10) && (n_right >= 10) &&
+                    (Hl_sum >= min_child_weight) && (Ht_sum - Hl_sum >= min_child_weight);
+          if (ok) {
+            float gain = total_base;
+            for (int c = 0; c < KH; c++) {
+              float Gr = GtK[c] - Gc[c], Hr = HtK[c] - Hc[c];
+              float Gc_thr = thr_l1(Gc[c], reg_alpha);
+              float Gr_thr = thr_l1(Gr, reg_alpha);
+              gain += 0.5f * mirror *
+                      (Gc_thr * Gc_thr / (Hc[c] + reg_lambda + EPS) +
+                       Gr_thr * Gr_thr / (Hr + reg_lambda + EPS));
+            }
+            if (gain > lb.gain) {
+              lb.gain = gain;
+              lb.axis = f;
+              lb.bcode = b;
+              lb.thr = ctx->ax_min[f] + ((float)(b + 1) / AX_BINS) * ctx->ax_range[f];
+              lb.default_left = 1;
+            }
+          }
         }
       }
     };
@@ -600,10 +768,19 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
       {
         int tid = omp_get_thread_num();
         BestSplit& l_best = local_bests[tid];
-        std::vector<float> Gc(K), Hc(K);
+        float Gc_stack[256], Hc_stack[256];
+        float* Gc = Gc_stack;
+        float* Hc = Hc_stack;
+        std::vector<float> Gc_vec, Hc_vec;
+        if (K > 256) {
+          Gc_vec.resize(K);
+          Hc_vec.resize(K);
+          Gc = Gc_vec.data();
+          Hc = Hc_vec.data();
+        }
 #pragma omp for schedule(static)
         for (int f = 0; f < D; f++) {
-          scan_feature(f, Gc.data(), Hc.data(), l_best);
+          scan_feature(f, Gc, Hc, l_best);
         }
       }
       for (int tid = 0; tid < max_t; tid++) {
@@ -616,13 +793,31 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
         }
       }
     } else {
-      std::vector<float> Gc(K), Hc(K);
-      for (int f = 0; f < D; f++) scan_feature(f, Gc.data(), Hc.data(), best);
+      float Gc_stack[256], Hc_stack[256];
+      float* Gc = Gc_stack;
+      float* Hc = Hc_stack;
+      std::vector<float> Gc_vec, Hc_vec;
+      if (K > 256) {
+        Gc_vec.resize(K);
+        Hc_vec.resize(K);
+        Gc = Gc_vec.data();
+        Hc = Hc_vec.data();
+      }
+      for (int f = 0; f < D; f++) scan_feature(f, Gc, Hc, best);
     }
 #else
     {
-      std::vector<float> Gc(K), Hc(K);
-      for (int f = 0; f < D; f++) scan_feature(f, Gc.data(), Hc.data(), best);
+      float Gc_stack[256], Hc_stack[256];
+      float* Gc = Gc_stack;
+      float* Hc = Hc_stack;
+      std::vector<float> Gc_vec, Hc_vec;
+      if (K > 256) {
+        Gc_vec.resize(K);
+        Hc_vec.resize(K);
+        Gc = Gc_vec.data();
+        Hc = Hc_vec.data();
+      }
+      for (int f = 0; f < D; f++) scan_feature(f, Gc, Hc, best);
     }
 #endif
 
@@ -630,6 +825,7 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
     cand_thr[t] = best.thr;
     cand_axis[t] = best.axis;
     cand_bcode[t] = best.bcode;
+    cand_default_left[t] = best.default_left;
     return best.gain;
   };
 
@@ -677,40 +873,19 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
     node_has_tot[0] = 1;
 
     node_hist[0] = get_hist();
-    accumulate_hist(sample_indices.data() + node_start[0], Ns, node_hist[0].data(), &node_P[0]);
+    accumulate_hist(sample_indices.data() + node_start[0], Ns, node_hist[0].data(), nullptr);
   }
 
   std::priority_queue<std::pair<float, int>> frontier;
-  if (Ns >= 20) frontier.push({node_P[0], 0});
+  float root_gain = eval_axis(0);
+  if (Ns >= 20 && root_gain > gamma && cand_axis[0] >= 0) {
+    frontier.push({root_gain, 0});
+  }
 
-  int splits_left = max_leaves - 1;
+  int splits_left = max_leaves_limit - 1;
   while (splits_left > 0 && !frontier.empty()) {
     int t_node = frontier.top().second;
     frontier.pop();
-
-    if (node_hist[t_node].empty()) {
-      int par_idx = parent[t_node];
-      int sib = sibling[t_node];
-      bool self_small = node_ns[t_node] <= node_ns[sib];
-      int t_small = self_small ? t_node : sib;
-      int t_large = self_small ? sib : t_node;
-
-      node_hist[t_small] = get_hist();
-      float* GF_RESTRICT hs = node_hist[t_small].data();
-      accumulate_hist(sample_indices.data() + node_start[t_small], node_ns[t_small], hs, nullptr);
-      float* GF_RESTRICT hp = node_hist[par_idx].data();
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-      for (size_t i = 0; i < HSZ; i++) hp[i] -= hs[i];
-      node_hist[t_large] = std::move(node_hist[par_idx]);
-    }
-
-    float ag = eval_axis(t_node);
-    if (ag <= 0.0f || cand_axis[t_node] < 0) {
-      recycle_hist(node_hist[t_node]);
-      continue;
-    }
 
     int depth_t = node_depth[t_node];
     int tl = tree->total_nodes;
@@ -731,15 +906,16 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
     tree->split_feature[t_node] = cand_axis[t_node];
     tree->split_threshold[t_node] = cand_thr[t_node];
     tree->split_gain[t_node] = cand_gain[t_node];
-    splits_left--;
+    tree->default_left[t_node] = cand_default_left[t_node];
 
     int start = node_start[t_node];
     int ns = node_ns[t_node];
     int ax = cand_axis[t_node];
     int bcode = cand_bcode[t_node];
+    uint8_t default_left_val = cand_default_left[t_node];
+    const bool is_num_feat = (ax < D_num);
 
     std::vector<float> GL(K, 0.0f), HL(K, 0.0f);
-    float PL = 0.0f;
     int total_left_count = 0;
 
 #ifdef _OPENMP
@@ -762,7 +938,6 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
         tHL = tHL_heap.data();
       }
 
-      std::vector<double> tPL(nthreads, 0.0);
       int actual_threads = nthreads;
 
 #pragma omp parallel num_threads(nthreads)
@@ -785,7 +960,14 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
             }
 #endif
             int j = sample_indices[start + si];
-            if (code[(size_t)j * D + ax] <= (uint8_t)bcode) {
+            int c_val = code[(size_t)j * D + ax];
+            bool go_left = false;
+            if (is_num_feat && c_val == AX_BINS - 1) {
+              go_left = (default_left_val == 1);
+            } else {
+              go_left = (c_val <= bcode);
+            }
+            if (go_left) {
               l_count++;
             } else {
               r_count++;
@@ -815,7 +997,6 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
 
         float* GF_RESTRICT gl = tGL + (size_t)tid * K;
         float* GF_RESTRICT hl = tHL + (size_t)tid * K;
-        double pl = 0.0;
 
         if (chunk_start < chunk_end) {
           for (int si = chunk_start; si < chunk_end; si++) {
@@ -828,7 +1009,14 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
             }
 #endif
             int j = sample_indices[start + si];
-            if (code[(size_t)j * D + ax] <= (uint8_t)bcode) {
+            int c_val = code[(size_t)j * D + ax];
+            bool go_left = false;
+            if (is_num_feat && c_val == AX_BINS - 1) {
+              go_left = (default_left_val == 1);
+            } else {
+              go_left = (c_val <= bcode);
+            }
+            if (go_left) {
               partition_scratch[write_l++] = j;
               const float* GF_RESTRICT gj = G + (size_t)j * K;
               const float* GF_RESTRICT hj = H + (size_t)j * K;
@@ -836,15 +1024,11 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
                 gl[c] += gj[c];
                 hl[c] += hj[c];
               }
-              for (int c = 0; c < K; c++) {
-                pl += 0.5 * (double)gj[c] * gj[c] / ((double)hj[c] + reg_lambda + EPS);
-              }
             } else {
               partition_scratch[write_r++] = j;
             }
           }
         }
-        tPL[tid] = pl;
       }
 
 #pragma omp parallel for schedule(static) num_threads(actual_threads)
@@ -852,7 +1036,6 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
         sample_indices[start + si] = partition_scratch[si];
       }
 
-      double PLd = 0.0;
       for (int t = 0; t < actual_threads; t++) {
         const float* GF_RESTRICT gl = tGL + (size_t)t * K;
         const float* GF_RESTRICT hl = tHL + (size_t)t * K;
@@ -860,9 +1043,7 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
           GL[c] += gl[c];
           HL[c] += hl[c];
         }
-        PLd += tPL[t];
       }
-      PL = (float)PLd;
       total_left_count = start_left[actual_threads - 1] + count_left[actual_threads - 1];
     } else
 #endif
@@ -870,7 +1051,14 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
       int total_left = 0;
       for (int si = 0; si < ns; si++) {
         int j = sample_indices[start + si];
-        if (code[(size_t)j * D + ax] <= (uint8_t)bcode) {
+        int c_val = code[(size_t)j * D + ax];
+        bool go_left = false;
+        if (is_num_feat && c_val == AX_BINS - 1) {
+          go_left = (default_left_val == 1);
+        } else {
+          go_left = (c_val <= bcode);
+        }
+        if (go_left) {
           total_left++;
         }
       }
@@ -887,16 +1075,20 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
         }
 #endif
         int j = sample_indices[start + si];
-        if (code[(size_t)j * D + ax] <= (uint8_t)bcode) {
+        int c_val = code[(size_t)j * D + ax];
+        bool go_left = false;
+        if (is_num_feat && c_val == AX_BINS - 1) {
+          go_left = (default_left_val == 1);
+        } else {
+          go_left = (c_val <= bcode);
+        }
+        if (go_left) {
           partition_scratch[write_l++] = j;
           const float* GF_RESTRICT gj = G + (size_t)j * K;
           const float* GF_RESTRICT hj = H + (size_t)j * K;
           for (int c = 0; c < K; c++) {
             GL[c] += gj[c];
             HL[c] += hj[c];
-          }
-          for (int c = 0; c < K; c++) {
-            PL += 0.5f * gj[c] * gj[c] / (hj[c] + reg_lambda + EPS);
           }
         } else {
           partition_scratch[write_r++] = j;
@@ -913,8 +1105,6 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
     node_start[tr_node] = start + total_left;
     node_ns[tr_node] = total_right;
 
-    node_P[tl] = PL;
-    node_P[tr_node] = node_P[t_node] - PL;
     for (int c = 0; c < K; c++) {
       node_G[(size_t)tl * K + c] = GL[c];
       node_H[(size_t)tl * K + c] = HL[c];
@@ -923,16 +1113,42 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
     }
     node_has_tot[tl] = node_has_tot[tr_node] = 1;
 
-    bool can_deepen = (depth_t + 1 < internal_depth) && (splits_left > 0);
-    if (can_deepen) {
-      for (int child : {tl, tr_node}) {
-        int cns = node_ns[child];
-        if (cns < 20) continue;
-        if (node_P[child] > 0.0f) frontier.push({node_P[child], child});
+    splits_left--;
+
+    bool can_deepen_tl = (depth_t + 1 < internal_depth) && (splits_left > 0) && (total_left >= 20);
+    bool can_deepen_tr = (depth_t + 1 < internal_depth) && (splits_left > 0) && (total_right >= 20);
+
+    if (can_deepen_tl || can_deepen_tr) {
+      int t_small = (total_left <= total_right) ? tl : tr_node;
+      int t_large = (t_small == tl) ? tr_node : tl;
+
+      node_hist[t_small] = get_hist();
+      accumulate_hist(sample_indices.data() + node_start[t_small], node_ns[t_small], node_hist[t_small].data(), nullptr);
+
+      node_hist[t_large] = get_hist();
+      float* GF_RESTRICT hl = node_hist[t_large].data();
+      const float* GF_RESTRICT hs = node_hist[t_small].data();
+      const float* GF_RESTRICT hp = node_hist[t_node].data();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) if(HSZ >= 131072)
+#endif
+      for (size_t i = 0; i < HSZ; i++) hl[i] = hp[i] - hs[i];
+
+      if (can_deepen_tl) {
+        float gain_l = eval_axis(tl);
+        if (gain_l > gamma && cand_axis[tl] >= 0) {
+          frontier.push({gain_l, tl});
+        }
       }
-    } else {
-      recycle_hist(node_hist[t_node]);
+      if (can_deepen_tr) {
+        float gain_r = eval_axis(tr_node);
+        if (gain_r > gamma && cand_axis[tr_node] >= 0) {
+          frontier.push({gain_r, tr_node});
+        }
+      }
     }
+
+    recycle_hist(node_hist[t_node]);
   }
 
   for (int t = 0; t < tree->total_nodes; t++) {
@@ -950,7 +1166,7 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
       bool use_parent = (t > 0) && hasv[par_idx];
       for (int c = 0; c < K; c++) {
         float Gs = node_G[(size_t)t * K + c], Hs = node_H[(size_t)t * K + c];
-        float raw = -Gs / (Hs + reg_lambda + EPS);
+        float raw = -thr_l1(Gs, reg_alpha) / (Hs + reg_lambda + EPS);
         float v = use_parent
                       ? (Hs * raw + reg_lambda * sm[(size_t)par_idx * K + c]) /
                             (Hs + reg_lambda + EPS)
@@ -982,7 +1198,7 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
       const int D_cat = has_meta ? (D - D_num) : 0;
       const bool has_cached_flat = (int)tree->use_flat_lookup.size() == D_cat;
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for schedule(static) if(N >= 16384)
 #endif
       for (int i = 0; i < N; i++) {
         if (in_sub[i]) continue;
@@ -992,32 +1208,35 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
           int feat = tree->split_feature[t];
           float val = xi[feat];
 
-          if (has_meta) {
+          if (std::isnan(val)) {
             if (feat < D_num) {
-              if (std::isnan(val)) val = tree->na_means[feat];
+              t = (tree->default_left[t] == 1) ? tree->left_child[t] : tree->right_child[t];
+              continue;
             } else {
-              int fc = feat - D_num;
-              if (std::isnan(val) || fc >= (int)tree->cat_ranks.size()) {
-                val = tree->na_means[feat];
-              } else {
-                if (has_cached_flat && tree->use_flat_lookup[fc]) {
-                  int ival = (int)std::lrintf(val);
-                  int offset_val = ival - tree->cat_min_val[fc];
-                  if (offset_val >= 0 &&
-                      offset_val < (int)tree->flat_cat_ranks[fc].size()) {
-                    val = tree->flat_cat_ranks[fc][offset_val];
-                  } else {
-                    val = tree->na_means[feat];
-                  }
+              val = tree->na_means[feat];
+            }
+          } else if (has_meta && feat >= D_num) {
+            int fc = feat - D_num;
+            if (fc >= (int)tree->cat_ranks.size()) {
+              val = tree->na_means[feat];
+            } else {
+              if (has_cached_flat && tree->use_flat_lookup[fc]) {
+                int ival = (int)std::lrintf(val);
+                int offset_val = ival - tree->cat_min_val[fc];
+                if (offset_val >= 0 &&
+                    offset_val < (int)tree->flat_cat_ranks[fc].size()) {
+                  val = tree->flat_cat_ranks[fc][offset_val];
                 } else {
-                  const auto& m = tree->cat_ranks[fc];
-                  int target_key = (int)std::lrintf(val);
-                  auto it = std::lower_bound(m.begin(), m.end(), std::make_pair(target_key, 0.0f),
-                                             [](const std::pair<int, float>& a, const std::pair<int, float>& b) {
-                                               return a.first < b.first;
-                                             });
-                  val = (it != m.end() && it->first == target_key) ? it->second : tree->na_means[feat];
+                  val = tree->na_means[feat];
                 }
+              } else {
+                const auto& m = tree->cat_ranks[fc];
+                int target_key = (int)std::lrintf(val);
+                auto it = std::lower_bound(m.begin(), m.end(), std::make_pair(target_key, 0.0f),
+                                           [](const std::pair<int, float>& a, const std::pair<int, float>& b) {
+                                             return a.first < b.first;
+                                           });
+                val = (it != m.end() && it->first == target_key) ? it->second : tree->na_means[feat];
               }
             }
           }
@@ -1070,36 +1289,39 @@ GF_API void basicdt_predict(void* tree_handle, const float* X, int N, int K,
       int feat = tree->split_feature[t];
       float val = xi[feat];
 
-      if (has_meta) {
+      if (std::isnan(val)) {
         if (feat < D_num) {
-          if (std::isnan(val)) val = tree->na_means[feat];
+          t = (tree->default_left[t] == 1) ? tree->left_child[t] : tree->right_child[t];
+          continue;
         } else {
-          int fc = feat - D_num;
-          if (std::isnan(val) || fc >= (int)tree->cat_ranks.size()) {
-            val = tree->na_means[feat];
-          } else {
-            if (has_cached_flat && tree->use_flat_lookup[fc]) {
-              int ival = (int)std::lrintf(val);
-              int offset_val = ival - tree->cat_min_val[fc];
-              if (offset_val >= 0 &&
-                  offset_val < (int)tree->flat_cat_ranks[fc].size()) {
-                val = tree->flat_cat_ranks[fc][offset_val];
-              } else {
-                val = tree->na_means[feat];
-              }
+          val = tree->na_means[feat];
+        }
+      } else if (has_meta && feat >= D_num) {
+        int fc = feat - D_num;
+        if (fc >= (int)tree->cat_ranks.size()) {
+          val = tree->na_means[feat];
+        } else {
+          if (has_cached_flat && tree->use_flat_lookup[fc]) {
+            int ival = (int)std::lrintf(val);
+            int offset_val = ival - tree->cat_min_val[fc];
+            if (offset_val >= 0 &&
+                offset_val < (int)tree->flat_cat_ranks[fc].size()) {
+              val = tree->flat_cat_ranks[fc][offset_val];
             } else {
-              const auto& m = tree->cat_ranks[fc];
-              int target_key = (int)std::lrintf(val);
-              auto it = std::lower_bound(m.begin(), m.end(),
-                                         std::make_pair(target_key, 0.0f),
-                                         [](const std::pair<int, float>& a,
-                                            const std::pair<int, float>& b) {
-                                           return a.first < b.first;
-                                         });
-              val = (it != m.end() && it->first == target_key)
-                        ? it->second
-                        : tree->na_means[feat];
+              val = tree->na_means[feat];
             }
+          } else {
+            const auto& m = tree->cat_ranks[fc];
+            int target_key = (int)std::lrintf(val);
+            auto it = std::lower_bound(m.begin(), m.end(),
+                                       std::make_pair(target_key, 0.0f),
+                                       [](const std::pair<int, float>& a,
+                                          const std::pair<int, float>& b) {
+                                         return a.first < b.first;
+                                       });
+            val = (it != m.end() && it->first == target_key)
+                      ? it->second
+                      : tree->na_means[feat];
           }
         }
       }
@@ -1118,6 +1340,7 @@ struct BasicDTCompactNode {
   int32_t feat = -1;
   float thr = 0.0f;
   int32_t left = -1, right = -1;  // compact ids; -1 → leaf
+  uint8_t default_left = 1;
 };
 
 // Ensemble predict on RAW X
@@ -1240,6 +1463,7 @@ GF_API void basicdt_predict_ensemble(void* const* handles, int n_trees,
         nodes[c].thr = tr->split_threshold[h];
         nodes[c].left = next;
         nodes[c].right = next + 1;
+        nodes[c].default_left = tr->default_left[h];
         next += 2;
       }
     }
@@ -1319,9 +1543,10 @@ GF_API void basicdt_predict_ensemble(void* const* handles, int n_trees,
         while (nd[n].left >= 0) {
           float val = rp[nd[n].feat];
           if (nd[n].feat < D_num && std::isnan(val)) {
-            val = trees[0]->na_means[nd[n].feat];
+            n = (nd[n].default_left == 1) ? nd[n].left : nd[n].right;
+          } else {
+            n = (val < nd[n].thr) ? nd[n].left : nd[n].right;
           }
-          n = (val < nd[n].thr) ? nd[n].left : nd[n].right;
         }
         const float* lv = flat_leaves.data() + leaf_offset[t] + (size_t)n * K;
         for (int k = 0; k < K; k++) oi[k] += lr * lv[k];
@@ -1403,7 +1628,7 @@ GF_API int basicdt_get_D(void* handle) {
 GF_API void basicdt_export(void* handle, int* split_feature,
                            float* split_threshold, float* leaf_values,
                            uint8_t* is_leaf, int* left_child,
-                           int* right_child) {
+                           int* right_child, uint8_t* default_left) {
   const BasicDTTree* tree = static_cast<const BasicDTTree*>(handle);
   int n = tree->total_nodes, K = tree->K;
   for (int i = 0; i < n; ++i) split_feature[i] = tree->split_feature[i];
@@ -1413,13 +1638,32 @@ GF_API void basicdt_export(void* handle, int* split_feature,
   for (int i = 0; i < n; ++i) is_leaf[i] = tree->is_leaf[i];
   for (int i = 0; i < n; ++i) left_child[i] = tree->left_child[i];
   for (int i = 0; i < n; ++i) right_child[i] = tree->right_child[i];
+  if ((int)tree->default_left.size() >= n) {
+    for (int i = 0; i < n; ++i) default_left[i] = tree->default_left[i];
+  } else {
+    for (int i = 0; i < n; ++i) default_left[i] = 1;
+  }
+}
+
+// Additive export of per-node split gain (the K-summed gain used to pick the
+// shared split). Kept separate from basicdt_export so the serialization ABI
+// stays unchanged. Internal nodes hold their split gain; leaves hold 0.
+GF_API void basicdt_export_gain(void* handle, float* split_gain) {
+  const BasicDTTree* tree = static_cast<const BasicDTTree*>(handle);
+  int n = tree->total_nodes;
+  if ((int)tree->split_gain.size() < n) {
+    for (int i = 0; i < n; ++i) split_gain[i] = 0.0f;
+    return;
+  }
+  for (int i = 0; i < n; ++i) split_gain[i] = tree->split_gain[i];
 }
 
 GF_API void* basicdt_from_arrays(const int* split_feature,
                                  const float* split_threshold,
                                  const float* leaf_values,
                                  const uint8_t* is_leaf, const int* left_child,
-                                 const int* right_child, int total_nodes, int K,
+                                 const int* right_child, const uint8_t* default_left,
+                                 int total_nodes, int K,
                                  int max_depth, int D) {
   BasicDTTree* tree = new BasicDTTree();
   tree->total_nodes = total_nodes;
@@ -1432,6 +1676,11 @@ GF_API void* basicdt_from_arrays(const int* split_feature,
   tree->is_leaf.assign(is_leaf, is_leaf + total_nodes);
   tree->left_child.assign(left_child, left_child + total_nodes);
   tree->right_child.assign(right_child, right_child + total_nodes);
+  if (default_left) {
+    tree->default_left.assign(default_left, default_left + total_nodes);
+  } else {
+    tree->default_left.assign(total_nodes, 1);
+  }
   return static_cast<void*>(tree);
 }
 

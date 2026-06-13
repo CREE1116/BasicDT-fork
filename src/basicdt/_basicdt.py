@@ -48,11 +48,14 @@ def _get_basicdt_lib():
     lib.basicdt_get_D.argtypes = [ctypes.c_void_p]
     lib.basicdt_get_D.restype = ctypes.c_int
 
-    lib.basicdt_export.argtypes = [ctypes.c_void_p, _pi, _pf, _pf, _pu8, _pi, _pi]
+    lib.basicdt_export.argtypes = [ctypes.c_void_p, _pi, _pf, _pf, _pu8, _pi, _pi, _pu8]
     lib.basicdt_export.restype = None
 
+    lib.basicdt_export_gain.argtypes = [ctypes.c_void_p, _pf]
+    lib.basicdt_export_gain.restype = None
+
     lib.basicdt_from_arrays.argtypes = [
-        _pi, _pf, _pf, _pu8, _pi, _pi,
+        _pi, _pf, _pf, _pu8, _pi, _pi, _pu8,
         ctypes.c_int,  # total_nodes
         ctypes.c_int,  # K
         ctypes.c_int,  # max_depth
@@ -67,6 +70,7 @@ def _get_basicdt_lib():
         ctypes.c_int,  # D_num
         _pi,           # sub   [Ns]
         ctypes.c_int,  # Ns
+        ctypes.c_int,  # max_bin
     ]
     lib.basicdt_ctx_create.restype = ctypes.c_void_p
 
@@ -84,7 +88,13 @@ def _get_basicdt_lib():
         _pi,              # sub      [Ns]
         ctypes.c_int,     # Ns
         ctypes.c_int,     # max_depth
+        ctypes.c_int,     # max_leaves
         ctypes.c_float,   # reg_lambda
+        ctypes.c_float,   # colsample (bynode)
+        ctypes.c_uint,    # col_seed
+        ctypes.c_float,   # gamma
+        ctypes.c_float,   # min_child_weight
+        ctypes.c_float,   # reg_alpha
         _pf,              # out_pred [N, K]
     ]
     lib.basicdt_build.restype = ctypes.c_void_p
@@ -183,20 +193,30 @@ class BasicDTree:
     def __init__(
         self,
         max_depth:    int   = 4,
+        max_leaves:   int | None = None,
         reg_lambda:   float = 1.0,
         subsample:    float = 1.0,
         random_state: int | None = None,
+        gamma:        float = 0.0,
+        min_child_weight: float = 1.0,
+        reg_alpha:    float = 0.0,
     ):
         self.max_depth    = max_depth
+        self.max_leaves   = max_leaves
         self.reg_lambda   = reg_lambda
         self.subsample    = subsample
         self.random_state = random_state
+        self.gamma        = gamma
+        self.min_child_weight = min_child_weight
+        self.reg_alpha    = reg_alpha
         self._tree_handle = None
         self._K           = None
 
     @classmethod
-    def _from_handle(cls, handle, K: int, max_depth: int, reg_lambda: float):
-        t = cls(max_depth=max_depth, reg_lambda=reg_lambda)
+    def _from_handle(cls, handle, K: int, max_depth: int, reg_lambda: float, max_leaves: int | None = None,
+                     gamma: float = 0.0, min_child_weight: float = 1.0, reg_alpha: float = 0.0):
+        t = cls(max_depth=max_depth, max_leaves=max_leaves, reg_lambda=reg_lambda,
+                gamma=gamma, min_child_weight=min_child_weight, reg_alpha=reg_alpha)
         t._tree_handle = handle
         t._K = K
         return t
@@ -223,10 +243,15 @@ class BasicDTree:
             else:
                 subset = np.arange(N, dtype=np.int32)
 
+        max_l = self.max_leaves
+        if max_l is None or max_l <= 0:
+            max_l = 1 << self.max_depth
         ctx = BasicDContext(X, D_num=D_num)
         try:
             tree, out_pred = ctx.build(
-                G, H, subset, self.max_depth, self.reg_lambda
+                G, H, subset, self.max_depth, max_l, self.reg_lambda,
+                gamma=self.gamma, min_child_weight=self.min_child_weight,
+                reg_alpha=self.reg_alpha,
             )
         finally:
             ctx.close()
@@ -235,15 +260,61 @@ class BasicDTree:
         self._K = K
         return out_pred
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, X: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
         if self._tree_handle is None:
             raise RuntimeError("Tree is not fitted.")
         X   = np.ascontiguousarray(X, dtype=np.float32)
         N   = X.shape[0]
-        out = np.zeros((N, self._K), dtype=np.float32)
+        if out is None:
+            out = np.zeros((N, self._K), dtype=np.float32)
+        else:
+            if out.shape != (N, self._K) or out.dtype != np.float32 or not out.flags.c_contiguous:
+                raise ValueError("out must be a contiguous float32 array of shape (N, K)")
         lib = _get_basicdt_lib()
         lib.basicdt_predict(self._tree_handle, _fptr(X), N, self._K, _fptr(out))
         return out
+
+    def export_arrays(self) -> dict:
+        """Return the fitted tree as flat numpy arrays for inspection/explanation.
+
+        Keys: split_feature, threshold, leaf_vals (n_nodes×K), is_leaf,
+        left_child, right_child, split_gain, n_nodes, K. Internal nodes hold
+        split_feature/threshold/gain; leaves hold the K-vector leaf_vals.
+        """
+        if self._tree_handle is None:
+            raise RuntimeError("Tree is not fitted.")
+        lib     = _get_basicdt_lib()
+        h       = self._tree_handle
+        n_nodes = lib.basicdt_get_total_nodes(h)
+        K       = self._K
+
+        split_feature = np.empty(n_nodes,     dtype=np.int32)
+        threshold     = np.empty(n_nodes,     dtype=np.float32)
+        leaf_vals     = np.empty(n_nodes * K, dtype=np.float32)
+        is_leaf       = np.empty(n_nodes,     dtype=np.uint8)
+        left_child    = np.empty(n_nodes,     dtype=np.int32)
+        right_child   = np.empty(n_nodes,     dtype=np.int32)
+        default_left  = np.empty(n_nodes,     dtype=np.uint8)
+        split_gain    = np.empty(n_nodes,     dtype=np.float32)
+        lib.basicdt_export(
+            h, _iptr(split_feature), _fptr(threshold), _fptr(leaf_vals),
+            is_leaf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            _iptr(left_child), _iptr(right_child),
+            default_left.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+        )
+        lib.basicdt_export_gain(h, _fptr(split_gain))
+        return {
+            "split_feature": split_feature,
+            "threshold":     threshold,
+            "leaf_vals":     leaf_vals.reshape(n_nodes, K),
+            "is_leaf":       is_leaf,
+            "left_child":    left_child,
+            "right_child":   right_child,
+            "default_left":  default_left,
+            "split_gain":    split_gain,
+            "n_nodes":       n_nodes,
+            "K":             K,
+        }
 
     def __getstate__(self):
         base = {
@@ -268,10 +339,12 @@ class BasicDTree:
         is_leaf   = np.empty(n_nodes,     dtype=np.uint8)
         left_child = np.empty(n_nodes,     dtype=np.int32)
         right_child = np.empty(n_nodes,     dtype=np.int32)
+        default_left = np.empty(n_nodes,     dtype=np.uint8)
         lib.basicdt_export(
             h, _iptr(split_feature), _fptr(threshold), _fptr(leaf_vals),
             is_leaf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             _iptr(left_child), _iptr(right_child),
+            default_left.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
         )
 
         sizes = np.zeros(4, dtype=np.int32)
@@ -297,6 +370,7 @@ class BasicDTree:
             "is_leaf":       is_leaf,
             "left_child":    left_child,
             "right_child":   right_child,
+            "default_left":  default_left,
             "D_num":         D_num,
             "D_cat":         D_cat,
             "na_len":        na_len,
@@ -304,24 +378,38 @@ class BasicDTree:
             "cat_sizes":     cat_sizes[:D_cat],
             "cat_keys":      cat_keys[:n_entries],
             "cat_vals":      cat_vals[:n_entries],
+            "max_leaves":    self.max_leaves,
+            "gamma":         self.gamma,
+            "min_child_weight": self.min_child_weight,
+            "reg_alpha":     self.reg_alpha,
         })
         return base
 
     def __setstate__(self, state):
         self.max_depth    = state["max_depth"]
+        self.max_leaves   = state.get("max_leaves")
         self.reg_lambda   = state["reg_lambda"]
         self.subsample    = state.get("subsample", 1.0)
         self.random_state = state.get("random_state")
+        self.gamma        = state.get("gamma", 0.0)
+        self.min_child_weight = state.get("min_child_weight", 1.0)
+        self.reg_alpha    = state.get("reg_alpha", 0.0)
         self._K           = state["K"]
         self._tree_handle = None
         if state["handle"] is None:
             return
         lib = _get_basicdt_lib()
         s   = state
+        default_l = s.get("default_left", None)
+        if default_l is None:
+            default_l = np.ones(s["n_nodes"], dtype=np.uint8)
+        else:
+            default_l = np.ascontiguousarray(default_l, dtype=np.uint8)
         handle = lib.basicdt_from_arrays(
             _iptr(s["split_feature"]), _fptr(s["threshold"]), _fptr(s["leaf_vals"]),
             s["is_leaf"].ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             _iptr(s["left_child"]), _iptr(s["right_child"]),
+            default_l.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
             s["n_nodes"], s["K"], s["tree_max_depth"], s["D"]
         )
         na_means  = np.ascontiguousarray(s["na_means"],  dtype=np.float32)
@@ -344,14 +432,16 @@ class BasicDTree:
 
 
 class BasicDContext:
-    def __init__(self, X: np.ndarray, D_num: int | None = None):
+    def __init__(self, X: np.ndarray, D_num: int | None = None, max_bin: int = 256):
         self.X = np.ascontiguousarray(X, dtype=np.float32)
         self.N, self.D = self.X.shape
         self.D_num = self.D if D_num is None else int(D_num)
+        self.max_bin = int(max_bin)
         sub = np.arange(self.N, dtype=np.int32)
         lib = _get_basicdt_lib()
         self._handle = lib.basicdt_ctx_create(
-            _fptr(self.X), self.N, self.D, self.D_num, _iptr(sub), self.N
+            _fptr(self.X), self.N, self.D, self.D_num, _iptr(sub), self.N,
+            self.max_bin,
         )
 
     def build(
@@ -360,7 +450,14 @@ class BasicDContext:
         H: np.ndarray,
         sub: np.ndarray,
         max_depth: int,
+        max_leaves: int,
         reg_lambda: float,
+        colsample: float = 1.0,
+        col_seed: int = 0,
+        gamma: float = 0.0,
+        min_child_weight: float = 1.0,
+        reg_alpha: float = 0.0,
+        out_pred: np.ndarray | None = None,
     ) -> tuple[BasicDTree, np.ndarray]:
         if self._handle is None:
             raise RuntimeError("Context is closed.")
@@ -368,16 +465,26 @@ class BasicDContext:
         H = np.ascontiguousarray(H, dtype=np.float32)
         sub = np.ascontiguousarray(sub, dtype=np.int32)
         K = G.shape[1]
-        out_pred = np.zeros((self.N, K), dtype=np.float32)
+        if out_pred is None:
+            out_pred = np.zeros((self.N, K), dtype=np.float32)
+        else:
+            if out_pred.shape != (self.N, K) or out_pred.dtype != np.float32 or not out_pred.flags.c_contiguous:
+                raise ValueError("out_pred must be a contiguous float32 array of shape (N, K)")
         lib = _get_basicdt_lib()
         handle = lib.basicdt_build(
             self._handle, _fptr(G), _fptr(H), K,
-            _iptr(sub), len(sub), max_depth,
+            _iptr(sub), len(sub), max_depth, max_leaves,
             ctypes.c_float(reg_lambda),
+            ctypes.c_float(colsample),
+            ctypes.c_uint(col_seed & 0xFFFFFFFF),
+            ctypes.c_float(gamma),
+            ctypes.c_float(min_child_weight),
+            ctypes.c_float(reg_alpha),
             _fptr(out_pred),
         )
 
-        tree = BasicDTree._from_handle(handle, K, max_depth, reg_lambda)
+        tree = BasicDTree._from_handle(handle, K, max_depth, reg_lambda, max_leaves=max_leaves,
+                                       gamma=gamma, min_child_weight=min_child_weight, reg_alpha=reg_alpha)
         return tree, out_pred
 
     def close(self):
