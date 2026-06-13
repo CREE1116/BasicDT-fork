@@ -117,7 +117,24 @@ accuracy.** `multi_strategy="shared"` is a further ~2.3x over `ovr` at low K.
 
 ---
 
-## 8. Misc
+## 8. Default profile — "Fast"
+
+Defaults were retuned for speed (user choice). All knobs remain overridable.
+
+| param | original | now |
+| :-- | :-- | :-- |
+| `n_estimators` | 1000 | 300 |
+| `learning_rate` | 0.03 | 0.08 |
+| `max_bin` | 256 | 64 |
+| `multi_strategy` | (shared only) | `"shared"` |
+| `goss` | (n/a) | `True` |
+
+Measured (K=3, 120k): new defaults **2.1s @ 0.9563** vs old-style accurate
+defaults (n=1000, lr=0.03, bin256, ovr) **18.4s @ 0.9597** — ~8.7x faster for
+~0.3pt accuracy. For max accuracy instead: `n_estimators=1000, learning_rate=0.03,
+max_bin=256, multi_strategy="ovr", goss=False`.
+
+## 9. Misc
 
 - `pyproject.toml`: `requires-python` `>=3.10` → `>=3.9` (code is 3.9-safe via
   `from __future__ import annotations`).

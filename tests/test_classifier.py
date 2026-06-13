@@ -78,7 +78,8 @@ def test_basicdt_categorical_handling():
 
 def test_basicdt_serialization_separate():
     X, y = make_classification(n_samples=150, n_features=6, n_classes=3, n_informative=4, random_state=42)
-    clf = BasicDTClassifier(n_estimators=5, max_depth=3, random_state=42)
+    clf = BasicDTClassifier(n_estimators=5, max_depth=3, random_state=42,
+                            multi_strategy="ovr")
     clf.fit(X, y)
 
     # Save to a temporary file
