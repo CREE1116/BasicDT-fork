@@ -301,32 +301,40 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
     for (int fc = 0; fc < D_cat; fc++) {
       int f = D_num + fc;
       int card = ctx->cat_card[fc];
-      if (card <= 1) {
+      // dense id `nan_id` is the reserved NaN slot; the n_eff real categories
+      // are ids 0..nan_id-1. Missing is handled XGB-style (sentinel bin +
+      // learned default direction), so the NaN slot is EXCLUDED from the
+      // target-gradient ranking and binned to AX_BINS-1, never ranked.
+      const int nan_id = card - 1;
+      const int n_eff = card - 1;
+      if (n_eff <= 1) {
         ctx->ax_range[f] = 0.0f;
         continue;
       }
-      std::vector<float> Gs(card, 0.0f), Hs(card, 0.0f);
+      std::vector<float> Gs(n_eff, 0.0f), Hs(n_eff, 0.0f);
       for (int si = 0; si < Ns; si++) {
         int i = sub[si];
         int id = ctx->cat_dense[(size_t)i * D_cat + fc];
+        if (id == nan_id) continue;  // missing: not part of the category order
         Gs[id] += G[(size_t)i * K + kdom];
         Hs[id] += H[(size_t)i * K + kdom];
       }
-      std::vector<float> score(card);
-      for (int id = 0; id < card; id++)
+      std::vector<float> score(n_eff);
+      for (int id = 0; id < n_eff; id++)
         score[id] = (float)(Gs[id] / (Hs[id] + reg_lambda + EPS));
-      std::vector<int> ord(card);
+      std::vector<int> ord(n_eff);
       std::iota(ord.begin(), ord.end(), 0);
       std::sort(ord.begin(), ord.end(), [&](int a, int b) {
         if (score[a] != score[b]) return score[a] < score[b];
         return a < b;
       });
       std::vector<float> rank_of(card);
-      for (int r = 0; r < card; r++) rank_of[ord[r]] = (float)r;
+      for (int r = 0; r < n_eff; r++) rank_of[ord[r]] = (float)r;
+      rank_of[nan_id] = -1.0f;  // sentinel: routed via the missing bin, not rank
 
       ctx->ax_min[f] = 0.0f;
-      ctx->ax_range[f] = (float)(card - 1);
-      float scale = (float)AX_BINS / ((float)(card - 1) + EPS);
+      ctx->ax_range[f] = (float)(n_eff - 1);
+      float scale = (float)AX_BINS / ((float)(n_eff - 1) + EPS);
 
       bool ranks_changed = true;
       if (fc < (int)ctx->prev_cat_ranks.size()) {
@@ -345,9 +353,15 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
 #pragma omp parallel for schedule(static)
 #endif
         for (int i = 0; i < N; i++) {
-          float r = rank_of[cd[(size_t)i * D_cat + fc]];
-          int b = (int)(r * scale);
-          if (b >= AX_BINS) b = AX_BINS - 1;
+          int id = cd[(size_t)i * D_cat + fc];
+          int b;
+          if (id == nan_id) {
+            b = AX_BINS - 1;  // missing sentinel
+          } else {
+            b = (int)(rank_of[id] * scale);
+            if (b > AX_BINS - 2) b = AX_BINS - 2;  // reserve top bin for missing
+            if (b < 0) b = 0;
+          }
           cw[(size_t)i * D + f] = (uint8_t)b;
         }
       }
@@ -358,7 +372,9 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
       }
       std::sort(rk.begin(), rk.end(),
                 [](const auto& a, const auto& b) { return a.first < b.first; });
-      tree->na_means[f] = rank_of[card - 1];
+      // NaN/unseen categoricals route via default_left at predict; the old
+      // na_means imputation rank is no longer used for routing.
+      tree->na_means[f] = -1.0f;
     }
   }
   const uint8_t* GF_RESTRICT code = ctx->code.data();
@@ -617,8 +633,13 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
       if (do_colsample && !feat_include[f]) return;
       if (ctx->ax_range[f] == 0.0f) return;
       const float* GF_RESTRICT fbuf = hb + (size_t)f * AX_BINS * STRIDE;
-      const bool is_numeric = (f < D_num);
-      int limit_b = is_numeric ? (AX_BINS - 2) : (AX_BINS - 1);
+      // Unified missing handling (XGB-style) for BOTH numeric and categorical:
+      // the top bin (AX_BINS-1) is reserved as the missing sentinel for every
+      // feature, missing rows are tried on both sides of each candidate split,
+      // and the higher-gain direction is learned as default_left. A feature with
+      // no missing rows has an empty sentinel bin, so this reduces exactly to
+      // the plain sweep — categorical-without-missing is unchanged.
+      int limit_b = AX_BINS - 2;
       int min_b = 0;
       while (min_b < limit_b && fbuf[(size_t)min_b * STRIDE + COFF] == 0.0f) {
         min_b++;
@@ -631,7 +652,7 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
       std::memset(Hc, 0, KH * sizeof(float));
       int n_left = 0;
 
-      if (is_numeric) {
+      {
         const float* GF_RESTRICT missing_slot = fbuf + (size_t)(AX_BINS - 1) * STRIDE;
         const int n_missing = (int)missing_slot[COFF];
         float GM_stack[256], HM_stack[256];
@@ -716,40 +737,6 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
             lb.bcode = b;
             lb.thr = ctx->ax_min[f] + ((float)(b + 1) / AX_BINS) * ctx->ax_range[f];
             lb.default_left = best_default_left;
-          }
-        }
-      } else {
-        // Categorical split finding (standard)
-        for (int b = min_b; b < max_b; b++) {
-          const float* GF_RESTRICT slot = fbuf + (size_t)b * STRIDE;
-          n_left += (int)slot[COFF];
-          float Hl_sum = 0.0f;
-          for (int c = 0; c < KH; c++) {
-            Gc[c] += slot[GOFF + c];
-            Hc[c] += slot[HOFF + c];
-            Hl_sum += Hc[c];
-          }
-          Hl_sum *= mirror;
-          int n_right = ns - n_left;
-          bool ok = (n_left >= 10) && (n_right >= 10) &&
-                    (Hl_sum >= min_child_weight) && (Ht_sum - Hl_sum >= min_child_weight);
-          if (ok) {
-            float gain = total_base;
-            for (int c = 0; c < KH; c++) {
-              float Gr = GtK[c] - Gc[c], Hr = HtK[c] - Hc[c];
-              float Gc_thr = thr_l1(Gc[c], reg_alpha);
-              float Gr_thr = thr_l1(Gr, reg_alpha);
-              gain += 0.5f * mirror *
-                      (Gc_thr * Gc_thr / (Hc[c] + reg_lambda + EPS) +
-                       Gr_thr * Gr_thr / (Hr + reg_lambda + EPS));
-            }
-            if (gain > lb.gain) {
-              lb.gain = gain;
-              lb.axis = f;
-              lb.bcode = b;
-              lb.thr = ctx->ax_min[f] + ((float)(b + 1) / AX_BINS) * ctx->ax_range[f];
-              lb.default_left = 1;
-            }
           }
         }
       }
@@ -913,7 +900,6 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
     int ax = cand_axis[t_node];
     int bcode = cand_bcode[t_node];
     uint8_t default_left_val = cand_default_left[t_node];
-    const bool is_num_feat = (ax < D_num);
 
     std::vector<float> GL(K, 0.0f), HL(K, 0.0f);
     int total_left_count = 0;
@@ -962,7 +948,7 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
             int j = sample_indices[start + si];
             int c_val = code[(size_t)j * D + ax];
             bool go_left = false;
-            if (is_num_feat && c_val == AX_BINS - 1) {
+            if (c_val == AX_BINS - 1) {
               go_left = (default_left_val == 1);
             } else {
               go_left = (c_val <= bcode);
@@ -1011,7 +997,7 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
             int j = sample_indices[start + si];
             int c_val = code[(size_t)j * D + ax];
             bool go_left = false;
-            if (is_num_feat && c_val == AX_BINS - 1) {
+            if (c_val == AX_BINS - 1) {
               go_left = (default_left_val == 1);
             } else {
               go_left = (c_val <= bcode);
@@ -1053,7 +1039,7 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
         int j = sample_indices[start + si];
         int c_val = code[(size_t)j * D + ax];
         bool go_left = false;
-        if (is_num_feat && c_val == AX_BINS - 1) {
+        if (c_val == AX_BINS - 1) {
           go_left = (default_left_val == 1);
         } else {
           go_left = (c_val <= bcode);
@@ -1077,7 +1063,7 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
         int j = sample_indices[start + si];
         int c_val = code[(size_t)j * D + ax];
         bool go_left = false;
-        if (is_num_feat && c_val == AX_BINS - 1) {
+        if (c_val == AX_BINS - 1) {
           go_left = (default_left_val == 1);
         } else {
           go_left = (c_val <= bcode);
@@ -1240,6 +1226,12 @@ GF_API void* basicdt_build(void* ctx_handle, const float* G, const float* H,
               }
             }
           }
+          // Categorical missing / unseen (rank sentinel < 0) routes XGB-style
+          // via the learned default direction, same as numeric NaN.
+          if (feat >= D_num && val < 0.0f) {
+            t = (tree->default_left[t] == 1) ? tree->left_child[t] : tree->right_child[t];
+            continue;
+          }
           t = (val < tree->split_threshold[t]) ? tree->left_child[t] : tree->right_child[t];
         }
         const float* lv = tree->leaf_values.data() + (size_t)t * K;
@@ -1326,6 +1318,12 @@ GF_API void basicdt_predict(void* tree_handle, const float* X, int N, int K,
         }
       }
 
+      // Categorical missing / unseen (rank sentinel < 0) -> default direction.
+      if (feat >= D_num && val < 0.0f) {
+        t = (tree->default_left[t] == 1) ? tree->left_child[t]
+                                         : tree->right_child[t];
+        continue;
+      }
       t = (val < tree->split_threshold[t]) ? tree->left_child[t]
                                            : tree->right_child[t];
     }
@@ -1542,7 +1540,10 @@ GF_API void basicdt_predict_ensemble(void* const* handles, int n_trees,
         int n = 0;
         while (nd[n].left >= 0) {
           float val = rp[nd[n].feat];
-          if (nd[n].feat < D_num && std::isnan(val)) {
+          // Missing routes via the learned default direction (XGB-style):
+          // numeric NaN, or categorical missing/unseen (rank sentinel < 0).
+          bool missing = (nd[n].feat < D_num) ? std::isnan(val) : (val < 0.0f);
+          if (missing) {
             n = (nd[n].default_left == 1) ? nd[n].left : nd[n].right;
           } else {
             n = (val < nd[n].thr) ? nd[n].left : nd[n].right;
