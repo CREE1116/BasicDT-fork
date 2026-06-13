@@ -74,3 +74,27 @@ def test_basicdt_categorical_handling():
     assert preds.shape == (N,)
     probas = clf.predict_proba(df)
     assert np.allclose(probas.sum(axis=1), 1.0)
+
+
+def test_basicdt_serialization_separate():
+    X, y = make_classification(n_samples=150, n_features=6, n_classes=3, n_informative=4, random_state=42)
+    clf = BasicDTClassifier(n_estimators=5, max_depth=3, random_state=42)
+    clf.fit(X, y)
+
+    # Save to a temporary file
+    with tempfile.TemporaryDirectory() as tmpdir:
+        model_path = os.path.join(tmpdir, "basicdt_model_sep.pkl")
+        clf.save(model_path)
+
+        # Load back
+        clf_loaded = load_model(model_path)
+        assert clf_loaded.get_n_trees() == clf.get_n_trees()
+
+        # Compare predictions
+        preds_orig = clf.predict(X)
+        preds_loaded = clf_loaded.predict(X)
+        assert np.array_equal(preds_orig, preds_loaded)
+
+        probas_orig = clf.predict_proba(X)
+        probas_loaded = clf_loaded.predict_proba(X)
+        assert np.allclose(probas_orig, probas_loaded)

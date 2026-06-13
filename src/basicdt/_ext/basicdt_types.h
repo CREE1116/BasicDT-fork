@@ -17,6 +17,7 @@ struct BasicDTTree {
   std::vector<float>   split_gain;      // [total_nodes]
   std::vector<int>     left_child;      // [total_nodes]: left child pointer (-1 if leaf)
   std::vector<int>     right_child;     // [total_nodes]: right child pointer (-1 if leaf)
+  std::vector<uint8_t> default_left;    // [total_nodes]: 1 if missing goes left, 0 if right
 
   int D_num = 0;
   std::vector<float> na_means;  // [D]: numeric μ_f impute; cat cols: NaN-category rank

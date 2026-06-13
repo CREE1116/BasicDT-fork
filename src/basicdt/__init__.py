@@ -4,6 +4,7 @@ BasicDT — Fast Histogram-Based Axis-Aligned GBDT.
 
 from .classifier import BasicDTClassifier
 from ._basicdt import BasicDTree
+from .explain import feature_importances, explain_prediction
 
 
 def load_model(path: str) -> BasicDTClassifier:
@@ -16,4 +17,6 @@ __all__ = [
     "BasicDTClassifier",
     "BasicDTree",
     "load_model",
+    "feature_importances",
+    "explain_prediction",
 ]
