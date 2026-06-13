@@ -22,7 +22,7 @@ Defaults are chosen so existing behavior is unchanged unless a knob is set.
 | `max_bin` | XGB/LGBM | hardcoded `AX_BINS=256` | **runtime** bin count, engine-level (see §4) |
 | `colsample_bynode` | XGB/LGBM | — | per-node feature subsampling (node-seeded RNG, deterministic) |
 | `goss` / `goss_top_rate` / `goss_other_rate` | LGBM | — | Gradient-based One-Side Sampling (see §5) |
-| `multi_strategy` | — | shared only | `"ovr"` (standard K-trees, default) or `"shared"` (fast shared tree, see §3) |
+| `multi_strategy` | — | shared only | `"shared"` (fast shared tree, **default**) or `"ovr"` (standard K-trees); see §3 |
 
 Also added: **learned missing-value direction** (`default_left`) per split —
 XGB-style for **both numeric and categorical** features. The original imputed
@@ -48,12 +48,13 @@ from predictions, length mismatch raises.
 
 - **Original:** one *shared* tree per round with K-vector leaves for all K
   classes (split chosen by gain summed over classes).
-- **Now (default `multi_strategy="ovr"`):** standard one-vs-rest — K separate
-  trees per round (like XGBoost/LightGBM). K=2 still uses the binary fast path.
-- **`multi_strategy="shared"`** keeps the original shared-tree design. It is
-  **~2.3x faster at low K** (1 histogram pass vs K) with equal accuracy, because
-  the structure search is paid once. Profiling showed the OVR slowdown is
-  inherent (K× histogram passes), not Python/overhead (which is ~6%).
+- **`multi_strategy="ovr"`:** standard one-vs-rest — K separate trees per round
+  (like XGBoost/LightGBM). K=2 still uses the binary fast path.
+- **`multi_strategy="shared"` (current default):** keeps the original
+  shared-tree design. It is **~2.3x faster at low K** (1 histogram pass vs K)
+  with equal accuracy, because the structure search is paid once. Profiling
+  showed the OVR slowdown is inherent (K× histogram passes), not Python
+  overhead (which is ~6%). Chosen as the default in the Fast profile (§8).
 
 `predict_proba`, `explain`, and serialization all branch on `self._is_separate_`.
 
