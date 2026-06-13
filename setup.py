@@ -16,7 +16,10 @@ class CustomBuildPy(build_py):
         system = platform.system()
         if system == "Darwin":
             lib_name = "libbasicdt.dylib"
-            cmd = ["clang++", "-O3", "-march=native", "-ffast-math", "-funroll-loops", "-shared", "-fPIC", "-std=c++17",
+            # NOTE: do NOT use -ffast-math. It implies -ffinite-math-only, which makes
+            # std::isnan() fold to constant false and silently breaks all missing-value
+            # handling. -fno-math-errno keeps the SIMD speedup without touching NaN/Inf.
+            cmd = ["clang++", "-O3", "-march=native", "-fno-math-errno", "-funroll-loops", "-shared", "-fPIC", "-std=c++17",
                    "-framework", "Accelerate"]
             try:
                 omp = subprocess.check_output(["brew", "--prefix", "libomp"], stderr=subprocess.DEVNULL).decode().strip()
@@ -25,10 +28,12 @@ class CustomBuildPy(build_py):
                 pass
         elif system == "Windows":
             lib_name = "basicdt.dll"
-            cmd = ["cl", "/O2", "/fp:fast", "/LD", "/EHsc", "/openmp"]
+            # /fp:fast can break NaN semantics; /fp:precise keeps std::isnan correct.
+            cmd = ["cl", "/O2", "/fp:precise", "/LD", "/EHsc", "/openmp"]
         else:
             lib_name = "libbasicdt.so"
-            cmd = ["g++", "-O3", "-march=native", "-ffast-math", "-funroll-loops", "-shared", "-fPIC", "-std=c++17", "-fopenmp"]
+            # See Darwin note: -ffast-math breaks std::isnan. -fno-math-errno is safe.
+            cmd = ["g++", "-O3", "-march=native", "-fno-math-errno", "-funroll-loops", "-shared", "-fPIC", "-std=c++17", "-fopenmp"]
 
         src_path = os.path.join(src_ext_dir, "basicdt.cpp")
         src_lib  = os.path.join(src_ext_dir, lib_name)
