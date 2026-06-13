@@ -25,8 +25,12 @@ Defaults are chosen so existing behavior is unchanged unless a knob is set.
 | `multi_strategy` | — | shared only | `"ovr"` (standard K-trees, default) or `"shared"` (fast shared tree, see §3) |
 
 Also added: **learned missing-value direction** (`default_left`) per split —
-XGB-style, the engine now learns whether NaNs go left/right at each node instead
-of only imputing.
+XGB-style for **both numeric and categorical** features. The original imputed
+missing values (numeric → column mean; categorical → treated as a ranked
+category). Now missing rows are excluded from the split statistics, tried on
+both sides of each candidate split, and routed by the higher-gain default
+direction (sentinel bin `n_bins-1`); at predict, NaN **and unseen categories**
+follow that default. Unifies numeric/categorical missing handling.
 
 ---
 
