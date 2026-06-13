@@ -45,15 +45,15 @@ class BasicDTClassifier(BaseEstimator, ClassifierMixin):
 
     def __init__(
         self,
-        n_estimators:          int   = 1000,
-        learning_rate:         float = 0.03,
+        n_estimators:          int   = 300,
+        learning_rate:         float = 0.08,
         max_depth:             int   = 6,
         max_leaves:            int | None = None,
-        max_bin:               int   = 256,
+        max_bin:               int   = 64,
         reg_lambda:            float = 1.0,
         subsample:             float = 0.8,
         colsample_bynode:      float = 1.0,
-        multi_strategy:        str   = "ovr",
+        multi_strategy:        str   = "shared",
         early_stopping_rounds: int | None = 50,
         random_state:          int | None = None,
         verbose:               bool  = False,
@@ -64,7 +64,7 @@ class BasicDTClassifier(BaseEstimator, ClassifierMixin):
         min_child_weight:      float = 1.0,
         reg_alpha:             float = 0.0,
         gamma:                 float = 0.0,
-        goss:                  bool  = False,
+        goss:                  bool  = True,
         goss_top_rate:         float = 0.2,
         goss_other_rate:       float = 0.1,
     ):

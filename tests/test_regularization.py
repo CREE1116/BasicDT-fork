@@ -109,10 +109,10 @@ def test_multiclass_separate_trees():
     X, y = make_classification(n_samples=300, n_features=6, n_informative=4, n_classes=3, random_state=42)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
     
-    # Fit (separate trees are default for K>=3)
+    # Fit with explicit one-vs-rest (separate trees per class)
     clf = BasicDTClassifier(
         n_estimators=10, max_depth=4, learning_rate=0.1,
-        random_state=42, verbose=True
+        random_state=42, verbose=True, multi_strategy="ovr"
     )
     clf.fit(X_train, y_train, eval_set=[(X_test, y_test)])
     
